@@ -10,6 +10,11 @@ Session.vim
 /release
 /release_models
 /separated
+/sunafxinet/log_archive
+/sunafxinet/slurm-*.out
+/sunafxinet/__pycache__
+/sunafxinet/*.pth
+/sunafxinet/*.sh
 /tests
 /trash
 /misc
