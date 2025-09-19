@@ -14,8 +14,11 @@ Session.vim
 /sunafxinet/slurm-*.out
 /sunafxinet/__pycache__
 /sunafxinet/*.pth
-/sunafxinet/*.sh
+/sunafxinet/shell/*.sh
 /sunafxinet/*.json
+/sunafxinet/delta_mae_analysis
+/processed
+/sample
 /tests
 /trash
 /misc
