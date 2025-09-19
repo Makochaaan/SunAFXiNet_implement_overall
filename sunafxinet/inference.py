@@ -10,10 +10,26 @@ import json
 import argparse
 
 from sunafxinet import SunAFXiNet
+from datetime import datetime
 
 # ============================================================================
 # 推論関数 (Inference Function)
 # ============================================================================
+
+PARAM_NAMES = {
+    'Distortion': ['drive_db'],
+    'Chorus': ['rate_hz', 'depth', 'mix'],
+    'Delay': ['delay_seconds', 'feedback', 'mix'],
+    'Reverb': ['room_size', 'damping', 'wet_level', 'dry_level']
+}
+
+PARAM_RANGES = {
+    'Distortion': {'drive_db': (10, 40)},
+    'Chorus': {'rate_hz': (0.5, 5.0), 'depth': (0.2, 0.8), 'mix': (0.1, 0.5)},
+    'Delay': {'delay_seconds': (0.1, 0.8), 'feedback': (0.1, 0.6), 'mix': (0.1, 0.5)},
+    'Reverb': {'room_size': (0.1, 0.9), 'damping': (0.1, 0.9), 'wet_level': (0.1, 0.5), 'dry_level': (0.5, 0.9)}
+}
+
 
 def de_normalize_param(value, min_val, max_val):
     """[0, 1]の値を元の範囲に逆正規化する"""
@@ -47,21 +63,28 @@ def iterative_inference(model, wet_signal, effect_map, device, max_iterations=2)
             new_energy = torch.mean(s_hat_tensor**2)
             print(f" > Signal energy (prev): {prev_energy.item():.6f}, (new): {new_energy.item():.6f}")
             print(torch.abs(prev_energy - new_energy) / prev_energy)
-            if torch.abs(prev_energy - new_energy) / prev_energy < 1e-5:
+            if torch.abs(prev_energy - new_energy) / prev_energy < 1e-6:
                 print("Stopping: Signal energy change is negligible.")
                 break
                 
             pred_type_name = inv_effect_map[pred_type_idx]
-            pred_params_normalized = param_predictions[pred_type_name].squeeze(0).cpu().numpy()
-            # パラメータを逆正規化
-            param_names = list(param_ranges[pred_type_name].keys())
-            de_normalized_params = {}
+            # モデルは[0,1]の正規化された値を予測する
+            pred_params_normalized = np.atleast_1d(param_predictions[pred_type_name].squeeze().cpu().numpy())
+            
+            # パラメータ名と値を対応付けながら、逆正規化する
+            param_names = PARAM_NAMES.get(pred_type_name, [])
+            de_normalized_params_dict = {}
             for j, param_name in enumerate(param_names):
-                min_val, max_val = param_ranges[pred_type_name][param_name]
+                min_val, max_val = PARAM_RANGES[pred_type_name][param_name]
+                # 予測された正規化値を元のスケールに戻す
                 real_value = de_normalize_param(pred_params_normalized[j], min_val, max_val)
-                de_normalized_params[param_name] = real_value
+                de_normalized_params_dict[param_name] = real_value
 
-            estimated_chain_reversed.append({'type': pred_type_name, 'params': de_normalized_params})
+            # pedalboardが直接使える辞書を保存する
+            estimated_chain_reversed.append({
+                'type': pred_type_name, 
+                'params': de_normalized_params_dict
+            })
             print(f" > Detected: {pred_type_name}")
             
             current_signal = s_hat_tensor.squeeze(1)
@@ -129,13 +152,15 @@ def main():
 
     # 音声ファイルの保存
     try:
-        sf.write(args.output, dry_signal, args.sr)
+        output_base, output_ext = os.path.splitext(args.output)
+        output_filename = f"{output_base}_{datetime.now().strftime('%m%d%H%M')}{output_ext}"
+        sf.write(output_filename, dry_signal, args.sr)
         print(f"\nSuccessfully saved processed audio to: {args.output}")
     except Exception as e:
         print(f"Error saving audio file: {e}")
 
     # エフェクトチェーンの保存
-    chain_output_path = os.path.splitext(args.output)[0] + '_effects.json'
+    chain_output_path = os.path.splitext(args.output)[0] + '_effects_' + datetime.now().strftime("%m%d%H%M") + '.json'
     try:
         with open(chain_output_path, 'w') as f:
             json.dump(estimated_chain, f, indent=4)

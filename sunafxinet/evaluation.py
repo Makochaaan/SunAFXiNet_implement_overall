@@ -29,6 +29,13 @@ EFFECT_PARAM_NAMES = {
     'Reverb': ['room_size', 'damping', 'wet_level', 'dry_level']
 }
 
+PARAM_RANGES = {
+    'Distortion': {'drive_db': (10, 40)},
+    'Chorus': {'rate_hz': (0.5, 5.0), 'depth': (0.2, 0.8), 'mix': (0.1, 0.5)},
+    'Delay': {'delay_seconds': (0.1, 0.8), 'feedback': (0.1, 0.6), 'mix': (0.1, 0.5)},
+    'Reverb': {'room_size': (0.1, 0.9), 'damping': (0.1, 0.9), 'wet_level': (0.1, 0.5), 'dry_level': (0.5, 0.9)}
+}
+
 # ============================================================================
 # 1. 評価用データセットクラス
 # ============================================================================
@@ -133,9 +140,24 @@ def evaluate_sunafxinet_step(model, data_loader, effect_map, device, mr_stft_los
 
             if pred_type_idx == gt_type_idx:
                 pred_params_raw = param_predictions[gt_type_name].squeeze().cpu().numpy()
-                pred_params = np.atleast_1d(pred_params_raw)
+                pred_params_normalized = np.atleast_1d(pred_params_raw)
+                # 1. 逆正規化のためのヘルパー関数を定義
+                def de_normalize_param(value, min_val, max_val):
+                    return value * (max_val - min_val) + min_val
+
+                # 2. 予測された正規化値を、元のスケールに逆正規化する
+                de_normalized_pred_params = []
+                param_names = list(PARAM_RANGES[gt_type_name].keys())
+                for i, param_name in enumerate(param_names):
+                    min_val, max_val = PARAM_RANGES[gt_type_name][param_name]
+                    real_value = de_normalize_param(pred_params_normalized[i], min_val, max_val)
+                    de_normalized_pred_params.append(real_value)
+
+                # 3. 正解パラメータ（本来の値）を取得
                 gt_params = [v.item() for v in gt_params_dict.values()]
-                mse = mean_squared_error(gt_params, pred_params[:len(gt_params)])
+                
+                # 4. 本来の値同士でMSEを計算する
+                mse = mean_squared_error(gt_params, de_normalized_pred_params[:len(gt_params)])
                 param_mses[gt_type_name].append(mse)
 
     # --- 結果の集計 ---
@@ -148,7 +170,7 @@ def evaluate_sunafxinet_step(model, data_loader, effect_map, device, mr_stft_los
         'param_mse': avg_param_mse
     }
 
-### Part 2: ドライ信号復元評価 ###
+### Part 2: ドライ信号復元評価 table4 ###
 def evaluate_dry_signal_recovery(model, data_loader, effect_map, device, mr_stft_loss):
     model.eval()
     si_snr_scores, mr_stft_scores = [], []
@@ -194,25 +216,16 @@ def evaluate_wet_signal_reproduction(model, data_loader, effect_map, device, mr_
 
             estimated_chain, pred_dry_signal = iterative_inference(model, wet_signal, effect_map, device)
 
-            # --- ▼▼▼ ここから修正 ▼▼▼ ---
-
-            # ヘルパー関数をループの外で一度だけ定義
-            def create_param_dict(effect_type, param_values):
-                param_names = EFFECT_PARAM_NAMES.get(effect_type, [])
-                return dict(zip(param_names, param_values))
-
-            # 推定されたチェーンを再適用
+            # 不要なヘルパー関数を削除し、try...exceptブロックのみを残す
             try:
-                # 各エフェクトのパラメータリストを辞書に変換してから渡す
+                # `iterative_inference`から返された辞書 `fx['params']` をそのまま展開する
                 board = pedalboard.Pedalboard([
-                    getattr(pedalboard, fx['type'])(**create_param_dict(fx['type'], fx['params']))
+                    getattr(pedalboard, fx['type'])(**fx['params'])
                     for fx in estimated_chain
                 ])
             except Exception as e:
                 print(f"Error creating pedalboard for {os.path.basename(wet_path)}, skipping sample: {e}")
                 continue # エラーが発生した場合はこのサンプルをスキップ
-
-            # --- ▲▲▲ 修正ここまで ▲▲▲ ---
             
             # 1. 推定されたドライ信号 x_hat からウェット信号を再現
             reproduced_wet_from_x_hat = board(pred_dry_signal, sr) if estimated_chain else pred_dry_signal
