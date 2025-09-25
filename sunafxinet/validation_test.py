@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 # 必要なクラスと関数をインポート
 from sunafxinet import SunAFXiNet
 from evaluation import EvaluationDataset # 既存の評価用Datasetを再利用
+from constant import PARAM_DIMS, HDEMUCS_CONFIG, NUM_EFFECTS, EFFECT_MAP
 
 # ============================================================================
 # 1. ΔMAEを計算するメイン関数
@@ -137,25 +138,14 @@ def main():
     parser.add_argument('--output-dir', type=str, default='./evaluation_results', help='Directory to save results (CSV, plot, thresholds).')
     args = parser.parse_args()
 
-    DATASET_DIR = '../../../dataset/sunafxinet/wet_signal_2way/valid'
+    VALID_DIR = '../../../dataset/sunafxinet/wet_signal_2way/valid'
 
     os.makedirs(args.output_dir, exist_ok=True)
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {DEVICE}")
 
-    # --- Model Configuration (Must match training) ---
-    # EFFECT_TYPES = ['Distortion', 'Chorus', 'Delay', 'Reverb']
-    EFFECT_TYPES = ['Distortion', 'Reverb']
-    EFFECT_MAP = {name: i for i, name in enumerate(EFFECT_TYPES)}
-    PARAM_DIMS = {'Distortion': 1, 'Chorus': 3, 'Delay': 3, 'Reverb': 4}
-    NUM_EFFECTS = len(EFFECT_TYPES)
-    
-    hdemucs_config = {
-        'audio_channels': 1, 'channels': 48, 'growth': 2, 'nfft': 4096,
-        'cac': True, 'depth': 5, 'rewrite': True, 'dconv_mode': 3,
-        't_layers': 4, 'samplerate': 48000, 'segment': 10.0,
-        't_heads': 8
-    }
+    hdemucs_config = HDEMUCS_CONFIG
+    hdemucs_config['samplerate'] = 48000
     
     print(f"Loading model from {args.model_path}...")
     model = SunAFXiNet(hdemucs_config, NUM_EFFECTS, PARAM_DIMS)
@@ -163,9 +153,9 @@ def main():
     model.to(DEVICE)
     print("Model loaded successfully.")
 
-    print(f"Loading validation data from {DATASET_DIR}...")
+    print(f"Loading validation data from {VALID_DIR}...")
     # 'dry_recovery'モードは(最終ウェット, 元のドライ)のペアと完全なメタデータを返すため、この分析に適している
-    valid_dataset = EvaluationDataset(metadata_dir=DATASET_DIR, mode='dry_recovery')
+    valid_dataset = EvaluationDataset(metadata_dir=VALID_DIR, mode='dry_recovery')
     valid_loader = DataLoader(valid_dataset, batch_size=1, shuffle=False, num_workers=0)
     print(f"Found {len(valid_dataset)} validation samples.")
 

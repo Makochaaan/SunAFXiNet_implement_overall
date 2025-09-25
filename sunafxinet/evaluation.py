@@ -13,6 +13,7 @@ import itertools
 # モデルと推論関数のインポート
 from sunafxinet import SunAFXiNet
 from inference import iterative_inference
+from constant import PARAM_DIMS, PARAM_RANGES, HDEMUCS_CONFIG, NUM_EFFECTS, EFFECT_MAP, EFFECT_PARAM_NAMES, PARAM_RANGES
 
 # 評価指標ライブラリ
 from torchmetrics.audio import ScaleInvariantSignalNoiseRatio
@@ -21,20 +22,6 @@ import auraloss
 
 # エフェクトを再適用するためのPedalboard
 import pedalboard
-
-EFFECT_PARAM_NAMES = {
-    'Distortion': ['drive_db'],
-    'Chorus': ['rate_hz', 'depth', 'mix'],
-    'Delay': ['delay_seconds', 'feedback', 'mix'],
-    'Reverb': ['room_size', 'damping', 'wet_level', 'dry_level']
-}
-
-PARAM_RANGES = {
-    'Distortion': {'drive_db': (10, 40)},
-    'Chorus': {'rate_hz': (0.5, 5.0), 'depth': (0.2, 0.8), 'mix': (0.1, 0.5)},
-    'Delay': {'delay_seconds': (0.1, 0.8), 'feedback': (0.1, 0.6), 'mix': (0.1, 0.5)},
-    'Reverb': {'room_size': (0.1, 0.9), 'damping': (0.1, 0.9), 'wet_level': (0.1, 0.5), 'dry_level': (0.5, 0.9)}
-}
 
 # ============================================================================
 # 1. 評価用データセットクラス
@@ -131,6 +118,7 @@ def evaluate_sunafxinet_step(model, data_loader, effect_map, device, mr_stft_los
             pred_for_mrstft = s_hat_original.squeeze(0)[:, :, :min_len]
             # [L] -> [1, L] -> [1, 1, L]
             target_for_mrstft = target_for_sisnr.unsqueeze(0).unsqueeze(0)
+            print(pred_for_mrstft.shape, target_for_mrstft.shape)
             mr_stft = mr_stft_loss(pred_for_mrstft, target_for_mrstft).item()
             mr_stft_scores.append(mr_stft)
 
@@ -285,19 +273,9 @@ def main():
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {DEVICE}")
 
-    # --- Model Configuration (Must match training) ---
-    # EFFECT_TYPES = ['Distortion', 'Chorus', 'Delay', 'Reverb']
-    EFFECT_TYPES = ['Distortion','Reverb']
-    EFFECT_MAP = {name: i for i, name in enumerate(EFFECT_TYPES)}
-    PARAM_DIMS = {'Distortion': 1, 'Chorus': 3, 'Delay': 3, 'Reverb': 4}
-    NUM_EFFECTS = len(EFFECT_TYPES)
-    
-    hdemucs_config = {
-        'audio_channels': 1, 'channels': 48, 'growth': 2, 'nfft': 4096,
-        'cac': True, 'depth': 5, 'rewrite': True, 'dconv_mode': 3,
-        't_layers': 4, 'samplerate': 48000, 'segment': 10.0,
-        't_heads': 8
-    }
+    # --- Model Configuration (Must match training) ---    
+    hdemucs_config = HDEMUCS_CONFIG
+    hdemucs_config['samplerate'] = 48000
     
     print(f"Loading model from {args.model_path}...")
     model = SunAFXiNet(hdemucs_config, NUM_EFFECTS, PARAM_DIMS)

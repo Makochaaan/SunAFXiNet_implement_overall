@@ -14,6 +14,7 @@ import argparse
 import matplotlib.pyplot as plt
 from datetime import datetime
 from sunafxinet import SunAFXiNet
+from constant import EFFECT_TYPES, PARAM_DIMS, NUM_EFFECTS, EFFECT_MAP, INV_EFFECT_MAP, HDEMUCS_CONFIG, BATCH_SIZE, LR_STAGE1, LR_STAGE2, EPOCHS_STAGE1, EPOCHS_STAGE2, LAMBDA_STFT, SAMPLE_RATE, PARAM_RANGES, DATASET_DIR
 
 def plot_losses(losses, stage_name, save_path=None):
     """
@@ -103,13 +104,7 @@ class AFXChainDataset(Dataset):
         params_dict = pair['effect_params']
         
         # 各エフェクトタイプのパラメータ範囲を定義
-        param_ranges = {
-            'Distortion': {'drive_db': (10, 40)},
-            'Chorus': {'rate_hz': (0.5, 5.0), 'depth': (0.2, 0.8), 'mix': (0.1, 0.5)},
-            'Delay': {'delay_seconds': (0.1, 0.8), 'feedback': (0.1, 0.6), 'mix': (0.1, 0.5)},
-            'Reverb': {'room_size': (0.1, 0.9), 'damping': (0.1, 0.9), 'wet_level': (0.1, 0.5), 'dry_level': (0.5, 0.9)}
-        }
-        
+        param_ranges = PARAM_RANGES
         # パラメータを正規化してベクトルに変換
         normalized_params = {}
         effect_type = pair['effect_type']
@@ -275,6 +270,9 @@ def train_stage2(model, data_loader, optimizer, criterion_ce, criterion_mse, inv
     print("\n--- Starting Training Stage 2: Training AFX Estimator (hafx) ---")
     losses = []  # loss値を記録するリスト
     
+    lambda_param = 1  # パラメータ回帰損失の重み
+    print(f"lambda = {lambda_param}")
+    
     for epoch in range(epochs):
         total_loss = 0
         for batch in tqdm(data_loader, desc=f"Epoch {epoch+1}/{epochs}"):
@@ -299,7 +297,7 @@ def train_stage2(model, data_loader, optimizer, criterion_ce, criterion_mse, inv
                     pred = param_predictions[type_name][mask, :p_dim]
                     true = param_vector[mask, :p_dim]
                     loss_mse += criterion_mse(pred, true)
-            loss = loss_ce + loss_mse
+            loss = loss_ce + lambda_param * loss_mse
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -320,15 +318,7 @@ if __name__ == '__main__':
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {DEVICE}")
-
-    # EFFECT_TYPES = ['Distortion', 'Chorus', 'Delay', 'Reverb']
-    EFFECT_TYPES = ['Distortion','Reverb']
-    EFFECT_MAP = {name: i for i, name in enumerate(EFFECT_TYPES)}
-    INV_EFFECT_MAP = {i: name for name, i in EFFECT_MAP.items()}
-    PARAM_DIMS = {'Distortion': 1, 'Chorus': 3, 'Delay': 3, 'Reverb': 4}
-    NUM_EFFECTS = len(EFFECT_TYPES)
-
-    DATASET_DIR = '../../../dataset/sunafxinet/wet_signal_2way/train'
+    print(DATASET_DIR)
     DRY_SIGNAL_DIR = '../../../dataset/sunafxinet/split_dry_signals/train_dry'
     
     # データ生成（必要に応じて実行）
@@ -339,19 +329,10 @@ if __name__ == '__main__':
     #     create_wet_signal_and_labels(dry_file, DATASET_DIR, EFFECT_TYPES)
     # print("dataset is created")
 
-    BATCH_SIZE = 4
-    LR_STAGE1, LR_STAGE2 = 5e-5, 5e-5
-    # EPOCHS_STAGE1, EPOCHS_STAGE2 = 400, 150
-    EPOCHS_STAGE1, EPOCHS_STAGE2 = 50, 40
-    LAMBDA_STFT = 0.05
-    SAMPLE_RATE = 48000
+    print("Using effect:", EFFECT_TYPES)
 
-    hdemucs_config = {
-        'audio_channels': 1, 'channels': 48, 'growth': 2, 'nfft': 4096,
-        'cac': True, 'depth': 5, 'rewrite': True, 'dconv_mode': 3,
-        't_layers': 4, 'samplerate': SAMPLE_RATE, 'segment': 10.0,
-        't_heads': 8
-    }
+    hdemucs_config = HDEMUCS_CONFIG
+    hdemucs_config['samplerate'] = SAMPLE_RATE
 
     print("Model initialized.")
     model = SunAFXiNet(hdemucs_config, NUM_EFFECTS, PARAM_DIMS).to(DEVICE)

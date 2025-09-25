@@ -10,27 +10,12 @@ import json
 import argparse
 
 from sunafxinet import SunAFXiNet
+from constant import PARAM_DIMS, PARAM_RANGES, HDEMUCS_CONFIG, NUM_EFFECTS, EFFECT_MAP, EFFECT_PARAM_NAMES, PARAM_RANGES
 from datetime import datetime
 
 # ============================================================================
 # 推論関数 (Inference Function)
 # ============================================================================
-
-PARAM_NAMES = {
-    'Distortion': ['drive_db'],
-    'Chorus': ['rate_hz', 'depth', 'mix'],
-    'Delay': ['delay_seconds', 'feedback', 'mix'],
-    'Reverb': ['room_size', 'damping', 'wet_level', 'dry_level']
-}
-
-PARAM_RANGES = {
-    'Distortion': {'drive_db': (10, 40)},
-    'Chorus': {'rate_hz': (0.5, 5.0), 'depth': (0.2, 0.8), 'mix': (0.1, 0.5)},
-    'Delay': {'delay_seconds': (0.1, 0.8), 'feedback': (0.1, 0.6), 'mix': (0.1, 0.5)},
-    'Reverb': {'room_size': (0.1, 0.9), 'damping': (0.1, 0.9), 'wet_level': (0.1, 0.5), 'dry_level': (0.5, 0.9)}
-}
-
-
 def de_normalize_param(value, min_val, max_val):
     """[0, 1]の値を元の範囲に逆正規化する"""
     return value * (max_val - min_val) + min_val
@@ -42,13 +27,6 @@ def iterative_inference(model, wet_signal, effect_map, device, max_iterations=2)
     estimated_chain_reversed = []
     inv_effect_map = {v: k for k, v in effect_map.items()}
 
-    param_ranges = {
-        'Distortion': {'drive_db': (10, 40)},
-        'Chorus': {'rate_hz': (0.5, 5.0), 'depth': (0.2, 0.8), 'mix': (0.1, 0.5)},
-        'Delay': {'delay_seconds': (0.1, 0.8), 'feedback': (0.1, 0.6), 'mix': (0.1, 0.5)},
-        'Reverb': {'room_size': (0.1, 0.9), 'damping': (0.1, 0.9), 'wet_level': (0.1, 0.5), 'dry_level': (0.5, 0.9)}
-    }
-    
     with torch.no_grad():
         for i in range(max_iterations):
             print(f"Running inference iteration {i+1}/{max_iterations}...")
@@ -72,7 +50,7 @@ def iterative_inference(model, wet_signal, effect_map, device, max_iterations=2)
             pred_params_normalized = np.atleast_1d(param_predictions[pred_type_name].squeeze().cpu().numpy())
             
             # パラメータ名と値を対応付けながら、逆正規化する
-            param_names = PARAM_NAMES.get(pred_type_name, [])
+            param_names = EFFECT_PARAM_NAMES.get(pred_type_name, [])
             de_normalized_params_dict = {}
             for j, param_name in enumerate(param_names):
                 min_val, max_val = PARAM_RANGES[pred_type_name][param_name]
@@ -108,20 +86,8 @@ def main():
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {DEVICE}")
 
-    # --- 設定 (学習時と完全に一致させる) ---
-    ### 重要: 以下の設定は、モデルの学習時に使用したものと完全に一致させる必要があります ###
-    # EFFECT_TYPES = ['Distortion', 'Chorus', 'Delay', 'Reverb']
-    EFFECT_TYPES = ['Distortion','Reverb']
-    EFFECT_MAP = {name: i for i, name in enumerate(EFFECT_TYPES)}
-    PARAM_DIMS = {'Distortion': 1, 'Chorus': 3, 'Delay': 3, 'Reverb': 4}
-    NUM_EFFECTS = len(EFFECT_TYPES)
-    
-    hdemucs_config = {
-        'audio_channels': 1, 'channels': 48, 'growth': 2, 'nfft': 4096,
-        'cac': True, 'depth': 5, 'rewrite': True, 'dconv_mode': 3,
-        't_layers': 4, 'samplerate': args.sr, 'segment': 10.0,
-        't_heads': 8
-    }
+    hdemucs_config = HDEMUCS_CONFIG
+    hdemucs_config['samplerate'] = args.sr
     
     # --- モデルのロード ---
     print(f"Loading model from {args.model_path}...")

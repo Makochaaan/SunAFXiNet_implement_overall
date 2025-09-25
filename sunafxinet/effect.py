@@ -9,9 +9,9 @@ import glob
 import itertools
 import shutil
 
+from constant import EFFECT_TYPES
+
 # エフェクトの定義
-# EFFECT_TYPES = ['Distortion', 'Chorus', 'Delay', 'Reverb']
-EFFECT_TYPES = ['Distortion','Reverb']
 
 def get_random_effect_params(effect_type):
     """ 指定されたエフェクトタイプのランダムなパラメータを返す """
@@ -105,7 +105,7 @@ def apply_chain_and_create_labels(dry_audio_path, output_dir, chain_definition, 
 if __name__ == '__main__':
     types = ["test","train","valid"]
     dry_signal_dirs = ['../../../dataset/sunafxinet/split_dry_signals/test_dry','../../../dataset/sunafxinet/split_dry_signals/train_dry','../../../dataset/sunafxinet/split_dry_signals/valid_dry'] # 前処理済みのドライ信号があるディレクトリ
-    dataset_output_dir_base = '../../../dataset/sunafxinet/wet_signal_2way/' # 生成されるウェット信号とメタデータを保存するディレクトリ
+    dataset_output_dir_base = '../../../dataset/sunafxinet/wet_signal_2way/reb-dis' # 生成されるウェット信号とメタデータを保存するディレクトリ
 
     if not os.path.exists(dataset_output_dir_base):
         os.makedirs(dataset_output_dir_base)
@@ -114,7 +114,8 @@ if __name__ == '__main__':
 
     for n, dry_signal_dir in enumerate(dry_signal_dirs):
         # 1. 64パターンのエフェクトチェーンを事前に生成
-        print("Generating 4 AFX chains...")
+        print(f"Generating {len(EFFECT_TYPES)} AFX chains...")
+        print("Using effect types:", EFFECT_TYPES)
         afx_chains = generate_afx_chains(EFFECT_TYPES)
         print(f"Generated {len(afx_chains)} chains.")
 
