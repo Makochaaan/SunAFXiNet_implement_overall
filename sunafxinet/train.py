@@ -16,20 +16,15 @@ from datetime import datetime
 from sunafxinet import SunAFXiNet
 from constant import EFFECT_TYPES, PARAM_DIMS, NUM_EFFECTS, EFFECT_MAP, INV_EFFECT_MAP, HDEMUCS_CONFIG, BATCH_SIZE, LR_STAGE1, LR_STAGE2, EPOCHS_STAGE1, EPOCHS_STAGE2, LAMBDA_STFT, SAMPLE_RATE, PARAM_RANGES, DATASET_DIR
 
-def plot_losses(losses, stage_name, save_path=None):
-    """
-    lossesの折れ線グラフを描画する関数
-    
-    Args:
-        losses (list): エポック毎のloss値のリスト
-        stage_name (str): ステージ名 ("Stage 1" or "Stage 2")
-        save_path (str, optional): 保存先のパス。Noneの場合は表示のみ
-    """
+def plot_losses(train_losses, valid_losses, stage_name, save_path=None):
+    """訓練損失と検証損失の折れ線グラフを描画する"""
     plt.figure(figsize=(10, 6))
-    plt.plot(range(1, len(losses) + 1), losses, marker='o', linewidth=2, markersize=4)
+    plt.plot(range(1, len(train_losses) + 1), train_losses, 'o-', label='Train Loss', linewidth=2, markersize=4)
+    plt.plot(range(1, len(valid_losses) + 1), valid_losses, 'o-', label='Validation Loss', linewidth=2, markersize=4)
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
-    plt.title(f'{stage_name} Training Loss Curve')
+    plt.title(f'{stage_name} Loss Curve')
+    plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     
@@ -153,6 +148,44 @@ class AFXChainDataset(Dataset):
 # dataset = AFXChainDataset(metadata_dir='/home/depontes25/Desktop/Research/Clone/SunAFXiNet/wet_signal/', effect_map=effect_map)
 # data_loader = torch.utils.data.DataLoader(dataset, batch_size=4, shuffle=True)
 
+# --- 検証ループ関数 ---
+def validate_epoch(model, valid_loader, criterion_mae, criterion_stft, criterion_ce, criterion_mse, device, stage):
+    """1エポック分の検証を行い、平均損失を返す"""
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for batch in tqdm(valid_loader, desc=f"Validating [Stage {stage}]", leave=False):
+            input_audio = batch['input_audio'].to(device)
+            target_audio = batch['target_audio'].to(device)
+            effect_type_label = batch['effect_type_label'].to(device)
+            
+            if stage == 1:
+                condition_one_hot = F.one_hot(effect_type_label, num_classes=NUM_EFFECTS).float()
+                s_hat, _, _ = model(input_audio, afx_type_condition=condition_one_hot)
+                s_hat_squeezed = s_hat.squeeze(1)
+                loss_mae = criterion_mae(s_hat_squeezed, target_audio)
+                loss_stft = criterion_stft(s_hat_squeezed, target_audio)
+                loss = loss_mae + LAMBDA_STFT * loss_stft
+            
+            elif stage == 2:
+                param_vector = batch['param_vector'].to(device)
+                _, type_logits, param_predictions = model(input_audio)
+                
+                loss_ce = criterion_ce(type_logits, effect_type_label)
+                loss_mse = 0
+                for type_idx, type_name in INV_EFFECT_MAP.items():
+                    mask = (effect_type_label == type_idx)
+                    if mask.any():
+                        p_dim = PARAM_DIMS[type_name]
+                        pred = param_predictions[type_name][mask, :p_dim]
+                        true = param_vector[mask, :p_dim]
+                        loss_mse += criterion_mse(pred, true)
+                loss = loss_ce + loss_mse # lambda_paramは後で追加可能
+            
+            total_loss += loss.item()
+            
+    return total_loss / len(valid_loader)
+
 # --- 推論関数 (完成版) ---
 def iterative_inference(model, wet_signal, effect_map, device, max_iterations=5, sr=48000):
     """
@@ -202,7 +235,7 @@ def iterative_inference(model, wet_signal, effect_map, device, max_iterations=5,
 
 # --- 学習プログラム ---
 
-def train_stage1(model, data_loader, optimizer, criterion_mae, criterion_stft, lambda_stft, device, epochs):
+def train_stage1(model, train_loader, valid_loader, optimizer, criterion_mae, criterion_stft, lambda_stft, device, epochs):
     """第1段階: バイパス信号推定器 (hsig) の学習"""
     model.train()
     # hafxを凍結
@@ -214,11 +247,14 @@ def train_stage1(model, data_loader, optimizer, criterion_mae, criterion_stft, l
             param.requires_grad = True
 
     print("--- Starting Training Stage 1: Training Bypassed Signal Estimator (hsig) ---")
-    losses = []  # loss値を記録するリスト
+    train_losses = []  # loss値を記録するリスト
+    valid_losses = []
+    best_valid_loss = float('inf')
+    equalization_count = 0
     
     for epoch in range(epochs):
         total_loss = 0
-        for batch in tqdm(data_loader, desc=f"Epoch {epoch+1}/{epochs}"):
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
             input_audio = batch['input_audio'].to(device)
             target_audio = batch['target_audio'].to(device)
             effect_type_label = batch['effect_type_label'].to(device)
@@ -249,14 +285,29 @@ def train_stage1(model, data_loader, optimizer, criterion_mae, criterion_stft, l
             optimizer.step()
             
             total_loss += loss.item()
-        
-        avg_loss = total_loss / len(data_loader)
-        losses.append(avg_loss)  # エポック毎の平均lossを記録
-        print(f"Stage 1, Epoch {epoch+1}/{epochs}, Average Loss: {avg_loss:.4f}")
     
-    return losses  # lossリストを返す
+        avg_train_loss = total_loss / len(train_loader)
+        avg_valid_loss = validate_epoch(model, valid_loader, criterion_mae, criterion_stft, None, None, device, stage=1)
+        
+        train_losses.append(avg_train_loss)
+        valid_losses.append(avg_valid_loss)
+        
+        print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.4f} | Valid Loss: {avg_valid_loss:.4f}")
 
-def train_stage2(model, data_loader, optimizer, criterion_ce, criterion_mse, inv_effect_map, param_dims, device, epochs):
+        if best_valid_loss - avg_valid_loss > 1e-5:  # 変化が小さい場合は更新しない
+            equalization_count = 0
+            best_valid_loss = avg_valid_loss
+            torch.save(model.state_dict(), f'./{SAVE_DIR}/best_model_final.pth')
+            print(f"  -> Found new best model! Saved to best_model_final.pth")
+        else:
+            equalization_count += 1
+            if equalization_count >= 5:
+                print("Early stopping triggered.")
+                break
+
+    return train_losses, valid_losses
+
+def train_stage2(model, train_loader, valid_loader, optimizer, criterion_ce, criterion_mse, inv_effect_map, param_dims, device, epochs):
     """第2段階: AFX推定器 (hafx) の学習"""
     model.train()
     # hafxを学習可能に
@@ -268,14 +319,16 @@ def train_stage2(model, data_loader, optimizer, criterion_ce, criterion_mse, inv
             param.requires_grad = False
 
     print("\n--- Starting Training Stage 2: Training AFX Estimator (hafx) ---")
-    losses = []  # loss値を記録するリスト
+    train_losses, valid_losses = [], [] # loss値を記録するリスト
+    best_valid_loss = float('inf')
+    equalization_count = 0
     
     lambda_param = 1  # パラメータ回帰損失の重み
     print(f"lambda = {lambda_param}")
     
     for epoch in range(epochs):
         total_loss = 0
-        for batch in tqdm(data_loader, desc=f"Epoch {epoch+1}/{epochs}"):
+        for batch in tqdm(train_loader, valid_loader, desc=f"Epoch {epoch+1}/{epochs}"):
             input_audio = batch['input_audio'].to(device)
             effect_type_label = batch['effect_type_label'].to(device)
             param_vector = batch['param_vector'].to(device)
@@ -305,21 +358,43 @@ def train_stage2(model, data_loader, optimizer, criterion_ce, criterion_mse, inv
             
             total_loss += loss.item()
             
-        avg_loss = total_loss / len(data_loader)
-        losses.append(avg_loss)  # エポック毎の平均lossを記録
-        print(f"Stage 2, Epoch {epoch+1}/{epochs}, Average Loss: {avg_loss:.4f}")
-    
-    return losses  # lossリストを返す
+        avg_train_loss = total_loss / len(train_loader)
+        avg_valid_loss = validate_epoch(model, valid_loader, None, None, criterion_ce, criterion_mse, device, stage=2)
+        
+        train_losses.append(avg_train_loss)
+        valid_losses.append(avg_valid_loss)
+        
+        print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.4f} | Valid Loss: {avg_valid_loss:.4f}")
+        
+        # if avg_valid_loss < best_valid_loss:
+        if best_valid_loss - avg_valid_loss > 1e-5:  # 変化が小さい場合は更新しない
+            equalization_count = 0
+            best_valid_loss = avg_valid_loss
+            torch.save(model.state_dict(), f'./{SAVE_DIR}/best_model_final.pth')
+            print(f"  -> Found new best model! Saved to best_model_final.pth")
+        else:
+            equalization_count += 1
+            if equalization_count >= 5:
+                print("Early stopping triggered.")
+                break
+
+    return train_losses, valid_losses  # lossリストを返す
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="SunAFXiNet Inference Script")
-    parser.add_argument('--stage', type=str, required=True, help='Training stage (1 or 2).')
+    parser.add_argument('--stage', type=str, required=True, choices=['1', '2', 'all'], help='Training stage to run (1, 2, or all).')
+    parser.add_argument('--train-data-dir', type=str, required=True, help='Path to the training set metadata directory.')
+    parser.add_argument('--valid-data-dir', type=str, required=True, help='Path to the validation set metadata directory.')
+    parser.add_argument('--stage1-model-path', type=str, default='sunafxinet_stage1.pth', help='Path to load/save the best Stage 1 model.')
     args = parser.parse_args()
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {DEVICE}")
     print(DATASET_DIR)
     DRY_SIGNAL_DIR = '../../../dataset/sunafxinet/split_dry_signals/train_dry'
+
+    SAVE_DIR = f'./{datetime.now().strftime("%m%d%H%M")}'
+    os.makedirs(SAVE_DIR, exist_ok=True)
     
     # データ生成（必要に応じて実行）
     # print("Generating dataset...")
@@ -337,16 +412,22 @@ if __name__ == '__main__':
     print("Model initialized.")
     model = SunAFXiNet(hdemucs_config, NUM_EFFECTS, PARAM_DIMS).to(DEVICE)
 
-    print("loading dataset...")
-    dataset = AFXChainDataset(metadata_dir=DATASET_DIR, effect_map=EFFECT_MAP, param_dims=PARAM_DIMS)
-    print(dataset.__len__())
-    data_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=True, drop_last=True)
+    # --- データローダーの準備 ---
+    print("Loading datasets...")
+    train_dataset = AFXChainDataset(metadata_dir=args.train_data_dir, effect_map=EFFECT_MAP, param_dims=PARAM_DIMS)
+    valid_dataset = AFXChainDataset(metadata_dir=args.valid_data_dir, effect_map=EFFECT_MAP, param_dims=PARAM_DIMS)
+    
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
+    valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+    print(f"Loaded {len(train_dataset)} training samples and {len(valid_dataset)} validation samples.")
 
-    optimizer_stage1 = optim.Adam([p for name, p in model.named_parameters() if 'hafx' not in name], lr=LR_STAGE1)
-    criterion_mae_s1 = nn.L1Loss().to(DEVICE)
+    # print("loading dataset...")
+    # dataset = AFXChainDataset(metadata_dir=DATASET_DIR, effect_map=EFFECT_MAP, param_dims=PARAM_DIMS)
+    # print(dataset.__len__())
+    # data_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=True, drop_last=True)
 
     # 1. 学習用データセットの総サンプル数を取得
-    total_train_samples = len(data_loader.dataset)
+    total_train_samples = len(train_loader.dataset)
 
     # 2. 最後のバッチに残るサンプル数を計算
     last_batch_size = total_train_samples % BATCH_SIZE
@@ -355,7 +436,9 @@ if __name__ == '__main__':
     # 【修正】MultiResolutionSTFTLossのパラメータを補完しました。
     # 一般的なオーディオ分離タスクで使われる標準的な設定です。
     # 論文のwin_length=8192はモデルのエンコーダ用であり、損失関数は複数の解像度で評価するのが一般的です。
-    if args.stage == "1":
+    if args.stage in ['1', 'all']:
+        optimizer_stage1 = optim.Adam([p for name, p in model.named_parameters() if 'hafx' not in name], lr=LR_STAGE1)
+        criterion_mae_s1 = nn.L1Loss().to(DEVICE)
         criterion_stft_s1 = auraloss.freq.MultiResolutionSTFTLoss(
             fft_sizes=[1024, 2048, 4096], 
             hop_sizes=[256, 512, 1024], 
@@ -363,17 +446,17 @@ if __name__ == '__main__':
             sample_rate=SAMPLE_RATE
         ).to(DEVICE)
     
-        losses = train_stage1(model, data_loader, optimizer_stage1, criterion_mae_s1, criterion_stft_s1, LAMBDA_STFT, DEVICE, EPOCHS_STAGE1)
-        torch.save(model.state_dict(), f'sunafxinet_stage1_{datetime.now().strftime("%m%d%H%M")}.pth')
+        train_losses_s1, valid_losses_s1 = train_stage1(model, train_loader, valid_loader, optimizer_stage1, criterion_mae_s1, criterion_stft_s1, LAMBDA_STFT, DEVICE, EPOCHS_STAGE1)
+        torch.save(model.state_dict(), f'./{SAVE_DIR}/{args.stage1_model_path}_{datetime.now().strftime("%m%d%H%M")}.pth')
         print("Saved Stage 1 model.")
         
         # Stage 1のlossグラフを保存
-        plot_losses(losses, "Stage 1", save_path="stage1_loss_curve.png")
+        plot_losses(train_losses_s1, valid_losses_s1, "Stage 1", save_path=f"./{SAVE_DIR}/stage1_loss_curve.png")
 
     elif args.stage == "2":
         # Stage 1で学習済みの重みを読み込み
         try:
-            model.load_state_dict(torch.load('sunafxinet_stage1.pth', map_location=DEVICE))
+            model.load_state_dict(torch.load(args.stage1_model_path, map_location=DEVICE))
             print("Loaded Stage 1 model weights.")
         except FileNotFoundError:
             print("Warning: sunafxinet_stage1.pth not found. Starting Stage 2 from random initialization.")
@@ -382,9 +465,9 @@ if __name__ == '__main__':
         criterion_ce_s2 = nn.CrossEntropyLoss().to(DEVICE)
         criterion_mse_s2 = nn.MSELoss().to(DEVICE)
 
-        losses = train_stage2(model, data_loader, optimizer_stage2, criterion_ce_s2, criterion_mse_s2, INV_EFFECT_MAP, PARAM_DIMS, DEVICE, EPOCHS_STAGE2)
-        torch.save(model.state_dict(), f'sunafxinet_final_{datetime.now().strftime("%m%d%H%M")}.pth')
+        train_losses_s2, valid_losses_s2 = train_stage2(model, train_loader, valid_loader, optimizer_stage2, criterion_ce_s2, criterion_mse_s2, DEVICE, EPOCHS_STAGE2)
+        torch.save(model.state_dict(), f'./{SAVE_DIR}/sunafxinet_final_{datetime.now().strftime("%m%d%H%M")}.pth')
         print("\nTraining complete. Final model saved as 'sunafxinet_final.pth'.")
         
         # Stage 2のlossグラフを保存
-        plot_losses(losses, "Stage 2", save_path="stage2_loss_curve.png")
+        plot_losses(train_losses_s2, valid_losses_s2, "Stage 2", save_path=f"./{SAVE_DIR}/stage2_loss_curve.png")
