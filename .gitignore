@@ -1,6 +1,7 @@
 *.egg-info
 __pycache__
 Session.vim
+*.pth
 /build
 /dist
 /lab
@@ -13,7 +14,6 @@ Session.vim
 /sunafxinet/log_archive
 /sunafxinet/slurm-*.out
 /sunafxinet/__pycache__
-/sunafxinet/*.pth
 /sunafxinet/shell/*.sh
 /sunafxinet/*.json
 /sunafxinet/delta_mae_analysis
