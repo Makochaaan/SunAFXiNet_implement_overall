@@ -5,6 +5,7 @@ from tqdm import tqdm
 import auraloss # auralossのインストールが必要です: pip install auraloss
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
 import soundfile as sf
 import json
 import glob
@@ -14,7 +15,7 @@ import argparse
 import matplotlib.pyplot as plt
 from datetime import datetime
 from sunafxinet import SunAFXiNet
-from constant import EFFECT_TYPES, PARAM_DIMS, NUM_EFFECTS, EFFECT_MAP, INV_EFFECT_MAP, HDEMUCS_CONFIG, BATCH_SIZE, LR_STAGE1, LR_STAGE2, EPOCHS_STAGE1, EPOCHS_STAGE2, LAMBDA_STFT, SAMPLE_RATE, PARAM_RANGES, DATASET_DIR
+from constant import EFFECT_TYPES, PARAM_DIMS, NUM_EFFECTS, EFFECT_MAP, INV_EFFECT_MAP, HDEMUCS_CONFIG, BATCH_SIZE, LR_STAGE1, LR_STAGE2, EPOCHS_STAGE1, EPOCHS_STAGE2, LAMBDA_STFT, SAMPLE_RATE, PARAM_RANGES
 
 def plot_losses(train_losses, valid_losses, stage_name, save_path=None):
     """訓練損失と検証損失の折れ線グラフを描画する"""
@@ -46,7 +47,6 @@ class AFXChainDataset(Dataset):
         """
         self.metadata_files = glob.glob(os.path.join(metadata_dir, '*_metadata.json'))
         self.effect_map = effect_map
-        self.training_pairs = self._create_training_pairs()
         self.param_dims = param_dims
         self.max_param_dim = max(param_dims.values()) if param_dims else 0
         self.training_pairs = self._create_training_pairs()
@@ -60,22 +60,23 @@ class AFXChainDataset(Dataset):
             chain = metadata['effect_chain']
             num_effects = len(chain)
 
-            for i in range(num_effects):
-                # 入力信号 u(k)
-                input_signal_path = metadata['intermediate_signals'][f'wet_{i}']
+            # 末尾のエフェクトのみを学習対象にする
+            i = num_effects - 1
+            # 入力信号 u(k): 最終wet信号
+            input_signal_path = metadata['intermediate_signals'][f'wet_{i}']
 
-                # ターゲット信号 s(k)
-                target_signal_path = metadata['intermediate_signals'].get(f'wet_{i-1}', metadata['dry_signal_path'])
+            # ターゲット信号 s(k): 1つ前の信号
+            target_signal_path = metadata['intermediate_signals'].get(f'wet_{i-1}', metadata['dry_signal_path'])
 
-                # 最後のAFXの情報
-                last_effect = chain[i]
+            # 末尾のエフェクト情報
+            last_effect = chain[i]
 
-                pairs.append({
-                    'input_path': input_signal_path,
-                    'target_path': target_signal_path,
-                    'effect_type': last_effect['type'],
-                    'effect_params': last_effect['params']
-                })
+            pairs.append({
+                'input_path': input_signal_path,
+                'target_path': target_signal_path,
+                'effect_type': last_effect['type'],
+                'effect_params': last_effect['params']
+            })
         return pairs
 
     def __len__(self):
@@ -85,8 +86,21 @@ class AFXChainDataset(Dataset):
         pair = self.training_pairs[idx]
 
         # 音声ファイルの読み込み
-        input_audio, _ = sf.read(pair['input_path'], dtype='float32')
+        input_audio, sr = sf.read(pair['input_path'], dtype='float32')
         target_audio, _ = sf.read(pair['target_path'], dtype='float32')
+
+        # 固定長セグメントにパディング/クロップ (HTDemucsは固定長を期待)
+        expected_length = int(SAMPLE_RATE * 10.0)  # 10秒セグメント
+        
+        if len(input_audio) < expected_length:
+            # パディング
+            pad_length = expected_length - len(input_audio)
+            input_audio = np.pad(input_audio, (0, pad_length), mode='constant')
+            target_audio = np.pad(target_audio, (0, pad_length), mode='constant')
+        elif len(input_audio) > expected_length:
+            # クロップ
+            input_audio = input_audio[:expected_length]
+            target_audio = target_audio[:expected_length]
 
         # チャンネル次元を追加 (B, C, L) -> (1, L)
         input_audio = torch.from_numpy(input_audio).unsqueeze(0)
@@ -108,7 +122,15 @@ class AFXChainDataset(Dataset):
         for param_name, value in params_dict.items():
             if effect_type in param_ranges and param_name in param_ranges[effect_type]:
                 min_val, max_val = param_ranges[effect_type][param_name]
-                normalized_params[param_name] = (value - min_val) / (max_val - min_val)
+                # drive_dbはdB値なので線形ゲインに変換してから正規化
+                if param_name == 'drive_db':
+                    # dBを線形ゲインに変換: gain = 10^(dB/20)
+                    value_linear = 10 ** (value / 20.0)
+                    min_linear = 10 ** (min_val / 20.0)
+                    max_linear = 10 ** (max_val / 20.0)
+                    normalized_params[param_name] = (value_linear - min_linear) / (max_linear - min_linear)
+                else:
+                    normalized_params[param_name] = (value - min_val) / (max_val - min_val)
             else:
                 normalized_params[param_name] = value  # 範囲が定義されていない場合はそのまま
         
@@ -135,7 +157,7 @@ class AFXChainDataset(Dataset):
         elif effect_type == 'Delay':
             param_values.extend([params_dict['delay_seconds'], params_dict['feedback'], params_dict['mix']])
         elif effect_type == 'Reverb':
-            param_values.extend([params_dict['room_size'], params_dict['damping'], params_dict['wet_level'], params_dict['dry_level']])
+            param_values.extend([params_dict['room_size'], params_dict['damping'], params_dict['wet_level']])
         
         # パディングされたベクトルに値を設定
         if param_values:
@@ -163,8 +185,14 @@ def validate_epoch(model, valid_loader, criterion_mae, criterion_stft, criterion
                 condition_one_hot = F.one_hot(effect_type_label, num_classes=NUM_EFFECTS).float()
                 s_hat, _, _ = model(input_audio, afx_type_condition=condition_one_hot)
                 s_hat_squeezed = s_hat.squeeze(1)
-                loss_mae = criterion_mae(s_hat_squeezed, target_audio)
-                loss_stft = criterion_stft(s_hat_squeezed, target_audio)
+                
+                # 長さを揃える
+                min_len = min(s_hat_squeezed.shape[-1], target_audio.shape[-1])
+                s_hat_squeezed = s_hat_squeezed[..., :min_len]
+                target_audio_trimmed = target_audio[..., :min_len]
+                
+                loss_mae = criterion_mae(s_hat_squeezed, target_audio_trimmed)
+                loss_stft = criterion_stft(s_hat_squeezed, target_audio_trimmed)
                 loss = loss_mae + LAMBDA_STFT * loss_stft
             
             elif stage == 2:
@@ -199,7 +227,7 @@ def iterative_inference(model, wet_signal, effect_map, device, max_iterations=5,
     # 推定されたエフェクトチェーンを格納するリスト
     estimated_chain_reversed = []
     
-    inv_effect_map = {v: k for k, v in effect_map.items()}
+    inv_effect_map = INV_EFFECT_MAP
     no_effect_idx = len(effect_map) # "no effect"クラスは最後のインデックスと仮定
 
     with torch.no_grad():
@@ -235,7 +263,18 @@ def iterative_inference(model, wet_signal, effect_map, device, max_iterations=5,
 
 # --- 学習プログラム ---
 
-def train_stage1(model, train_loader, valid_loader, optimizer, criterion_mae, criterion_stft, lambda_stft, device, epochs):
+def train_stage1(
+        model,
+        train_loader,
+        valid_loader,
+        optimizer,
+        criterion_mae,
+        criterion_stft,
+        lambda_stft,
+        device,
+        epochs,
+        stft_interval=4,
+    ):
     """第1段階: バイパス信号推定器 (hsig) の学習"""
     model.train()
     # hafxを凍結
@@ -252,6 +291,8 @@ def train_stage1(model, train_loader, valid_loader, optimizer, criterion_mae, cr
     best_valid_loss = float('inf')
     equalization_count = 0
     
+    scaler = GradScaler()
+    global_step = 0
     for epoch in range(epochs):
         total_loss = 0
         for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
@@ -262,29 +303,40 @@ def train_stage1(model, train_loader, valid_loader, optimizer, criterion_mae, cr
             # 正解のタイプをone-hotベクトルに変換して条件付けに用いる
             condition_one_hot = F.one_hot(effect_type_label, num_classes=model.hafx.num_effects).float()
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             
-            s_hat, _, _ = model(input_audio, afx_type_condition=condition_one_hot)
+            with autocast():
+                s_hat, _, _ = model(input_audio, afx_type_condition=condition_one_hot)
 
             # s_hat から不要な「ソース」次元 (dim=1) を削除する
             # [B, 1, C, L] -> [B, C, L]
             s_hat_squeezed = s_hat.squeeze(1)
 
-            # 形状が揃ったテンソルで損失を計算
-            loss_mae = criterion_mae(s_hat_squeezed, target_audio)
+            # 長さを揃える（短い方に合わせる）
+            min_len = min(s_hat_squeezed.shape[-1], target_audio.shape[-1])
+            s_hat_squeezed = s_hat_squeezed[..., :min_len]
+            target_audio_trimmed = target_audio[..., :min_len]
             
-            # STFT損失も同様に修正
-            loss_stft = criterion_stft(s_hat_squeezed, target_audio.squeeze(1))
+            loss_mae = criterion_mae(s_hat_squeezed, target_audio_trimmed)
+
+            if global_step % stft_interval == 0:
+                loss_stft = criterion_stft(
+                    s_hat_squeezed,
+                    target_audio_trimmed
+                )
+                loss = loss_mae + lambda_stft * loss_stft
+            else:
+                loss = loss_mae
             
-            # loss_mae = criterion_mae(s_hat, target_audio)
-            # loss_stft = criterion_stft(s_hat.squeeze(1), target_audio.squeeze(1))
-            loss = loss_mae + lambda_stft * loss_stft
-            
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            scaler.scale(loss).backward()
+            if global_step % stft_interval == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
             
             total_loss += loss.item()
+            global_step += 1
     
         avg_train_loss = total_loss / len(train_loader)
         avg_valid_loss = validate_epoch(model, valid_loader, criterion_mae, criterion_stft, None, None, device, stage=1)
@@ -307,7 +359,18 @@ def train_stage1(model, train_loader, valid_loader, optimizer, criterion_mae, cr
 
     return train_losses, valid_losses
 
-def train_stage2(model, train_loader, valid_loader, optimizer, criterion_ce, criterion_mse, inv_effect_map, param_dims, device, epochs):
+def train_stage2(
+        model,
+        train_loader,
+        valid_loader,
+        optimizer,
+        criterion_ce,
+        criterion_mse,
+        inv_effect_map,
+        param_dims,
+        device,
+        epochs
+    ):
     """第2段階: AFX推定器 (hafx) の学習"""
     model.train()
     # hafxを学習可能に
@@ -325,36 +388,40 @@ def train_stage2(model, train_loader, valid_loader, optimizer, criterion_ce, cri
     
     lambda_param = 1  # パラメータ回帰損失の重み
     print(f"lambda = {lambda_param}")
+
+    scaler = GradScaler()
     
     for epoch in range(epochs):
         total_loss = 0
-        for batch in tqdm(train_loader, valid_loader, desc=f"Epoch {epoch+1}/{epochs}"):
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
             input_audio = batch['input_audio'].to(device)
             effect_type_label = batch['effect_type_label'].to(device)
             param_vector = batch['param_vector'].to(device)
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
+            with autocast():
+                # モデル自身の推定を用いる (afx_type_condition=None)
+                _, type_logits, param_predictions = model(input_audio)
             
-            # モデル自身の推定を用いる (afx_type_condition=None)
-            _, type_logits, param_predictions = model(input_audio)
-            
-            # タイプ分類の損失
-            loss_ce = criterion_ce(type_logits, effect_type_label)
-            
-            # パラメータ回帰の損失
-            loss_mse = 0
-            for type_idx, type_name in inv_effect_map.items():
-                mask = (effect_type_label == type_idx)
-                if mask.any():
+                # タイプ分類の損失
+                loss_ce = criterion_ce(type_logits, effect_type_label)
+                
+                # パラメータ回帰の損失
+                loss_mse = 0.0
+                for b in range(input_audio.size(0)):
+                    gt_type = effect_type_label[b].item()
+                    type_name = inv_effect_map[gt_type]
                     p_dim = param_dims[type_name]
-                    pred = param_predictions[type_name][mask, :p_dim]
-                    true = param_vector[mask, :p_dim]
+
+                    pred = param_predictions[type_name][b, :p_dim]
+                    true = param_vector[b, :p_dim]
                     loss_mse += criterion_mse(pred, true)
-            loss = loss_ce + lambda_param * loss_mse
+
+                loss = loss_ce + lambda_param * loss_mse
             
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             
             total_loss += loss.item()
             
@@ -390,7 +457,6 @@ if __name__ == '__main__':
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {DEVICE}")
-    print(DATASET_DIR)
     DRY_SIGNAL_DIR = '../../../dataset/sunafxinet/split_dry_signals/train_dry'
 
     SAVE_DIR = f'./{datetime.now().strftime("%m%d%H%M")}'
@@ -464,8 +530,9 @@ if __name__ == '__main__':
         optimizer_stage2 = optim.Adam(model.hafx.parameters(), lr=LR_STAGE2)
         criterion_ce_s2 = nn.CrossEntropyLoss().to(DEVICE)
         criterion_mse_s2 = nn.MSELoss().to(DEVICE)
+        inv_effect_map = INV_EFFECT_MAP
 
-        train_losses_s2, valid_losses_s2 = train_stage2(model, train_loader, valid_loader, optimizer_stage2, criterion_ce_s2, criterion_mse_s2, DEVICE, EPOCHS_STAGE2)
+        train_losses_s2, valid_losses_s2 = train_stage2(model, train_loader, valid_loader, optimizer_stage2, criterion_ce_s2, criterion_mse_s2, inv_effect_map, PARAM_DIMS, DEVICE, EPOCHS_STAGE2)
         torch.save(model.state_dict(), f'./{SAVE_DIR}/sunafxinet_final_{datetime.now().strftime("%m%d%H%M")}.pth')
         print("\nTraining complete. Final model saved as 'sunafxinet_final.pth'.")
         

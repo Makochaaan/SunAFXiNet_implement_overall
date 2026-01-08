@@ -113,6 +113,11 @@ class SunAFXiNet(HTDemucs):
                     saved_t.append(xt)
                 else:
                     inject = xt
+                    # 時間次元を周波数ブランチに合わせて補間
+                    if inject is not None:
+                        target_time = x.shape[-1]
+                        if inject.shape[-1] != target_time:
+                            inject = F.interpolate(inject, size=target_time, mode='linear', align_corners=False)
             x = encode(x, inject)
             if idx == 0 and self.freq_emb is not None:
                 frs = torch.arange(x.shape[-2], device=x.device)
@@ -124,7 +129,15 @@ class SunAFXiNet(HTDemucs):
 
         # 1. hafxでAFXを推定 (Transformerに入る直前の周波数表現 `x` を使用)
         # print("start HAfx inference")
-        type_logits, param_predictions = self.hafx(x)
+        # Stage 1（afx_type_conditionが与えられる場合）はhafxは凍結されているため、
+        # 勾配計算を無効化して効率化
+        if afx_type_condition is not None:
+            # 学習ステージ1: hafxは凍結されているため勾配計算不要
+            with torch.no_grad():
+                type_logits, param_predictions = self.hafx(x)
+        else:
+            # 学習ステージ2 & 推論: hafxは学習可能または推論に使用
+            type_logits, param_predictions = self.hafx(x)
 
         # 2. 条件付け用のone-hotベクトルを決定
         # print("decide one-hot vector")

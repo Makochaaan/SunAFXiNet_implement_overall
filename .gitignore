@@ -11,6 +11,7 @@ Session.vim
 /release
 /release_models
 /separated
+/sunafxinet/dataset
 /sunafxinet/log_archive
 /sunafxinet/slurm-*.out
 /sunafxinet/__pycache__
