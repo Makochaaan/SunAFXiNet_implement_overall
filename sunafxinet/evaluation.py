@@ -16,7 +16,7 @@ from inference import iterative_inference
 from constant import PARAM_DIMS, PARAM_RANGES, HDEMUCS_CONFIG, NUM_EFFECTS, EFFECT_MAP, EFFECT_PARAM_NAMES, PARAM_RANGES
 
 # 評価指標ライブラリ
-from torchmetrics.audio import ScaleInvariantSignalNoiseRatio
+from torchmetrics.audio import ScaleInvariantSignalDistortionRatio
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, mean_squared_error
 import auraloss
 
@@ -53,14 +53,15 @@ class EvaluationDataset(Dataset):
             elif self.mode == 'bypassed_signal':
                 # Part 1: (中間ウェット信号, 1つ前の信号) のペア
                 chain = metadata['effect_chain']
-                for i in range(len(chain)):
-                    input_path = metadata['intermediate_signals'][f'wet_{i}']
-                    target_path = metadata['intermediate_signals'].get(f'wet_{i-1}', metadata['dry_signal_path'])
-                    pairs.append({
-                        'wet_path': input_path,
-                        'dry_path': target_path, # このモードでは 'dry_path' は bypassed_signal を指す
-                        'metadata': {'effect_chain': [chain[i]]} # 最後のAFX情報のみ
-                    })
+                # 末尾のエフェクトのみを評価
+                i = len(chain) - 1
+                input_path = metadata['intermediate_signals'][f'wet_{i}']  # 最終wet信号
+                target_path = metadata['intermediate_signals'].get(f'wet_{i-1}', metadata['dry_signal_path'])
+                pairs.append({
+                    'wet_path': input_path,
+                    'dry_path': target_path, # このモードでは 'dry_path' は bypassed_signal を指す
+                    'metadata': {'effect_chain': [chain[i]], 'effect_index': i} # 末尾のAFX情報のみ
+                })
         return pairs
 
     def __len__(self):
@@ -76,7 +77,7 @@ class EvaluationDataset(Dataset):
 ### Part 1: SunAFXiNet自体の評価 ###
 def evaluate_sunafxinet_step(model, data_loader, effect_map, device, mr_stft_loss):
     model.eval()
-    si_snr_scores = []
+    si_sdr_scores = []
     mr_stft_scores = []
     all_gt_types, all_pred_types = [], []
     param_mses = {name: [] for name in effect_map.keys()}
@@ -85,14 +86,20 @@ def evaluate_sunafxinet_step(model, data_loader, effect_map, device, mr_stft_los
         for batch in tqdm(data_loader, desc="Part 1: Evaluating SunAFXiNet Step"):
             wet_path = batch['wet_path'][0]
             target_path = batch['dry_path'][0] # bypassed signal
-            # 1. effect_chainリストから、最初の要素（エフェクト辞書）を取得
+            # データペアに保存されたエフェクト情報を取得（末尾のエフェクト）
             gt_effect = batch['metadata']['effect_chain'][0]
             
-            # 2. エフェクト辞書内の'type'キーの値（リスト）から、最初の要素（文字列）を取得
+            # エフェクトタイプを取得（メタデータではtypeはリスト形式）
             gt_type_name = gt_effect['type'][0]
             
-            # 3. パラメータ辞書を取得
-            gt_params_dict = gt_effect['params']
+            # パラメータ辞書を取得（tensor値を数値に変換）
+            gt_params_dict = {}
+            for param_name, param_value in gt_effect['params'].items():
+                if torch.is_tensor(param_value):
+                    gt_params_dict[param_name] = param_value.item()
+                else:
+                    gt_params_dict[param_name] = param_value
+            
             gt_type_idx = effect_map[gt_type_name]
 
             wet_signal, sr = librosa.load(wet_path, sr=48000, mono=True)
@@ -109,8 +116,9 @@ def evaluate_sunafxinet_step(model, data_loader, effect_map, device, mr_stft_los
             # s_hat_original から一時的な変数を作成
             pred_for_sisnr = s_hat_original.squeeze()[:min_len]
             target_for_sisnr = torch.from_numpy(target_signal[:min_len]).to(device)
-            si_snr = ScaleInvariantSignalNoiseRatio().to(device)(pred_for_sisnr, target_for_sisnr).item()
-            si_snr_scores.append(si_snr)
+            metric = ScaleInvariantSignalDistortionRatio().to(device)
+            si_sdr = metric(pred_for_sisnr, target_for_sisnr).item()
+            si_sdr_scores.append(si_sdr)
 
             # 2. MR-STFTのためのテンソル準備 (両方とも3D: [B, C, L])
             # 再び s_hat_original から一時的な変数を作成
@@ -130,19 +138,27 @@ def evaluate_sunafxinet_step(model, data_loader, effect_map, device, mr_stft_los
                 pred_params_raw = param_predictions[gt_type_name].squeeze().cpu().numpy()
                 pred_params_normalized = np.atleast_1d(pred_params_raw)
                 # 1. 逆正規化のためのヘルパー関数を定義
-                def de_normalize_param(value, min_val, max_val):
-                    return value * (max_val - min_val) + min_val
+                def de_normalize_param(value, min_val, max_val, param_name):
+                    if param_name == 'drive_db':
+                        # 線形ゲインスケールで逆正規化してからdBに変換
+                        min_linear = 10 ** (min_val / 20.0)
+                        max_linear = 10 ** (max_val / 20.0)
+                        linear_value = value * (max_linear - min_linear) + min_linear
+                        return 20.0 * np.log10(linear_value)
+                    else:
+                        return value * (max_val - min_val) + min_val
 
                 # 2. 予測された正規化値を、元のスケールに逆正規化する
                 de_normalized_pred_params = []
                 param_names = list(PARAM_RANGES[gt_type_name].keys())
                 for i, param_name in enumerate(param_names):
                     min_val, max_val = PARAM_RANGES[gt_type_name][param_name]
-                    real_value = de_normalize_param(pred_params_normalized[i], min_val, max_val)
+                    real_value = de_normalize_param(pred_params_normalized[i], min_val, max_val, param_name)
                     de_normalized_pred_params.append(real_value)
 
                 # 3. 正解パラメータ（本来の値）を取得
-                gt_params = [v.item() for v in gt_params_dict.values()]
+                # gt_params_dict の値はすでに数値に変換されているので、.item() は不要
+                gt_params = [v if not torch.is_tensor(v) else v.item() for v in gt_params_dict.values()]
                 
                 # 4. 本来の値同士でMSEを計算する
                 mse = mean_squared_error(gt_params, de_normalized_pred_params[:len(gt_params)])
@@ -152,7 +168,7 @@ def evaluate_sunafxinet_step(model, data_loader, effect_map, device, mr_stft_los
     accuracy = accuracy_score(all_gt_types, all_pred_types)
     avg_param_mse = {k: np.mean(v) if v else 0 for k, v in param_mses.items()}
     return {
-        'avg_si_snr': np.mean(si_snr_scores), 
+        'avg_si_sdr': np.mean(si_sdr_scores), 
         'avg_mr_stft': np.mean(mr_stft_scores), 
         'afx_accuracy': accuracy, 
         'param_mse': avg_param_mse
@@ -161,7 +177,7 @@ def evaluate_sunafxinet_step(model, data_loader, effect_map, device, mr_stft_los
 ### Part 2: ドライ信号復元評価 table4 ###
 def evaluate_dry_signal_recovery(model, data_loader, effect_map, device, mr_stft_loss):
     model.eval()
-    si_snr_scores, mr_stft_scores = [], []
+    si_sdr_scores, mr_stft_scores = [], []
     with torch.no_grad():
         for batch in tqdm(data_loader, desc="Part 2: Evaluating Dry Signal Recovery"):
             wet_path = batch['wet_path'][0]
@@ -176,8 +192,8 @@ def evaluate_dry_signal_recovery(model, data_loader, effect_map, device, mr_stft
             # 1. SI-SNRのためのテンソル準備 (1D: [L])
             pred_for_sisnr = torch.from_numpy(pred_dry_signal[:min_len]).to(device)
             target_for_sisnr = torch.from_numpy(true_dry_signal[:min_len]).to(device)
-            si_snr = ScaleInvariantSignalNoiseRatio().to(device)(pred_for_sisnr, target_for_sisnr).item()
-            si_snr_scores.append(si_snr)
+            si_sdr = ScaleInvariantSignalNoiseRatio().to(device)(pred_for_sisnr, target_for_sisnr).item()
+            si_sdr_scores.append(si_sdr)
 
             # 2. MR-STFTのためのテンソル準備 (3D: [B, C, L])
             # 1Dテンソルから .unsqueeze() を2回使って3Dテンソルを作成
@@ -186,7 +202,7 @@ def evaluate_dry_signal_recovery(model, data_loader, effect_map, device, mr_stft
             mr_stft = mr_stft_loss(pred_for_mrstft, target_for_mrstft).item()
             mr_stft_scores.append(mr_stft)
 
-    return {'avg_si_snr': np.mean(si_snr_scores), 'avg_mr_stft': np.mean(mr_stft_scores)}
+    return {'avg_si_sdr': np.mean(si_sdr_scores), 'avg_mr_stft': np.mean(mr_stft_scores)}
 
 ### Part 3: ウェット信号再現評価 ###
 def evaluate_wet_signal_reproduction(model, data_loader, effect_map, device, mr_stft_loss):
